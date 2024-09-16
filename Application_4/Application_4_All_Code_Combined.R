@@ -1,1038 +1,1026 @@
+
+# do I need any of the main functions for this....?
+
+
 ###############################################################################
 #                                                                     Spring 19
-#  Multi-state Capture-Recapture model (Humpback Chub) 
-#  JAGS Discrete Version
+#  Fitting an Integrated Population Model to Brown Trout Data
+#  Discrete JAGS version 
 #
 #  Notes:
+#  * The model runs from the fall of 2000 to fall of 2017 on a seasonal basis
+#  * We define three size states based on total length in mm 
+#    - 0 - 200; 200 - 350; 350 +
 #  * Need to set directory for data
-#  * Note that CH's are formatted so that each row only has the release and
-#    subsequent capture information
-#
-#	   Thus, a CH that is normally : 1 0 1 1 0 0  
-#
-#	   Would be formatted as such: 1 0 1 0 0 0 (fc = 1, lc =3)
-#			       	      0 0 1 1 0 0 (fc = 3, lc = 4)
-#			       	      0 0 0 1 0 0 (fc = 4, lc = 6)
-#
-#		 where fc = release occasion, lc = capture occasion
-#
-#  * States are defined as such:
-#		 1 = small adult captured in LCR
-#		 2 = large adult captured in LCR
-#		 3 = small adult captured in CR
-#		 4 = large adult captured in CR
-#		 5 = not observed
-#
-#	 * Fish are allowed to move between CR and LCR 
-#	 * Fish are allowed to grow from small to large adults
-#	 * Fish are not allowed to shrink (from large to small adults)
+#  * Need to supply JAGS/WinBUGS/Stan settings
 #
 ###############################################################################
 library(R2jags)
 
-# Get data:
-dat <- read.csv(".//HBC_data.csv")
-#-----------------------------------------------------------------------------#
-# Functions:
+# read in data
+NO_catch <- read.csv(paste0(getwd(), "/Data/", "NO_catch.csv"), header = TRUE)
+AZGF_catch <- read.csv(paste0(getwd(), "/Data/", "AZGF_catch.csv"), header = TRUE)
+MR_data <- read.csv(paste0(getwd(), "/Data/", "bCH.csv"), header = FALSE)
 
-#	Get first capture occasion:
-find.first <- function(x){min(which(x != 5))}
+# extract/reformat data
+bNOc <- NO_catch[,1:3]
+NOpasses <- NO_catch$NOpasses
+seasNO <- NO_catch$seasNO
+spawn <- ifelse(seasNO == 1, 4, 3)
+bAZ <- AZGF_catch[,1:3]
+ts <- AZGF_catch$ts
+AZeff <- AZGF_catch$AZeff
+NAZsamps <- length(AZeff)
 
-#	Get last capture occasion:
-find.last <- function(x){
-  ifelse(length(which(x !=5 )) == 1, 27, max(which(x != 5)))
-  }
+findlast <- function(x){ifelse(x[24] == 1, 23, max(which(x[1:23] != 4)))}
+indlast <- apply(MR_data, 1, findlast)
 
-#-----------------------------------------------------------------------------#
-# format data for model fitting:
-sumCH <- dat[,1:27]
-sumFR <- dat[,28]
-newtag.AO <- dat[,29]
-
-# other data:
-season <- c(rep(1:3,v8),v1:2) # season index
-LCRs <- c(2, 3, 5, 6, 8, 9, 11:26)
-LCRns <- c(1, 4, 7, 10)
-CRs <- c(1, 2, 4, 5, 7:26)
-CRns <- c(3, 6)
-catch <- matrix(c(287, 545, 221, 594, 215, 413, 500, 374, 562,
-                  193, 356, 171, 191, 111, 239, 259, 283, 246,
-                  102, 129, 154, 54, 63, 48, 36, 41, 35,
-                  35, 86, 126, 41, 43, 59, 22, 26, 34), nrow = 4, byrow = TRUE)
-
-
-# Re-format CH so that lines correspond to individuals (not unique capture histories):
-indCH <- numeric()
-for(i in 1:length(sumCH[,1])){
-  for(j in 1:sumFR[i]){
-    indCH <- rbind(indCH, sumCH[i,])
-  }
-}
-
-indCH <- as.matrix(indCH)
-indf <- apply(indCH, 1, find.first)
-indl <- apply(indCH, 1, find.last)
-
-# Create CH data matrix where state is known when fish is captured, otherwise NA:
-known.state <- indCH
-known.state[indCH == 5] <- NA
-known.state[,1] <- NA
-for(i in 1:dim(indCH)[1]){known.state[i,indf[i]] <- NA}
-
-# Create initial values for z-states (indicates whether fish is a small adult in
-# LCR (1), a large adult in LCR (2), a small adult in CR (3), or a large adult
-# in CR (4)
-# Note code does not allow fish to shrink, so initial values for z-states must
-# also not allow for shrinking
-z.init <- matrix(NA, nrow = dim(indCH)[1], ncol = 27)
-for(j in 1:dim(indCH)[1]){
-  z.init[j,(indf[j] + 1)] <- ifelse(indCH[j,(indf[j] + 1)] < 5, NA, indCH[j,indf[j]])
-  if(indf[j] < 26 & (indl[j] - indf[j]) > 1){
-    for(i in (indf[j]+2):indl[j]){
-      size <- c(1, 2, 1, 2, NA)
-      sizemax <- max(size[indCH[j,indf[j]:i]], na.rm = TRUE)
-      if(sizemax == 1){x <- c(1, 3)}
-      if(sizemax == 2){x <- c(2, 4)}
-      z.init[j,i] <- ifelse(indCH[j,i] < 5, NA, sample(x, 1))
-    }
-  }
-}
+indCH <- MR_data[,1:23]
+NindCH <- length(indlast)
+findfirst <- function(x){which(x != 4)[1]}
+indf <- apply(indCH, 1, findfirst)
 
 #-----------------------------------------------------------------------------#
-sink("JAGS_Discrete_chub.txt")
+sink("JAGS_Discrete.jags")
 cat("
 model{
+  # lphi is the logit of survival and is given a prior based on the Lorenzen
+  # function and the average mass of fish in each size class during each season.
+  # variation from the priod mode is determined by an estimated variance
+  # parameter (sd_lphi)
   
-  for(j in 1:4){
-    s_i[j] ~ dunif(0,1) # 3 month survival rates for small and large adults in LCR and CR
-    s[1,j] <- s_i[j]    # 3 month survival for spring to summer interval
-    s[2,j] <- s_i[j]    # 3 month survival for summer to fall interval
-    s[3,j] <- s_i[j] * s_i[j] # 6 month survival for fall to spring interval
-  } 
+  lphi[1,1] ~ dnorm(1.08, tau_lphi)
+  lphi[1,2] ~ dnorm(1.14, tau_lphi)
+  lphi[1,3] ~ dnorm(1.26, tau_lphi)
+  lphi[1,4] ~ dnorm(1.38, tau_lphi)
+  lphi[2,1] ~ dnorm(1.96, tau_lphi)
+  lphi[2,2] ~ dnorm(1.96, tau_lphi)
+  lphi[2,3] ~ dnorm(2.02, tau_lphi)
+  lphi[2,4] ~ dnorm(2.02, tau_lphi)
+  lphi[3,1] ~ dnorm(2.29, tau_lphi)
+  lphi[3,2] ~ dnorm(2.29, tau_lphi)
+  lphi[3,3] ~ dnorm(2.29, tau_lphi)
+  lphi[3,4] ~ dnorm(2.29, tau_lphi)
+  tau_lphi <- pow(sd_lphi, -2)
+  sd_lphi ~ dunif(0.01,4)
   
-  tau ~ dunif(0,1) # proportion of adults in the observable portion of the LCR
-  
-  for (i in 1:3){
-    g[i,1] ~ dunif(0,1) # LCR growth for three intervals
-    g[i,2] ~ dunif(0,1) # CR growth for three intervals
-    m[i,1] ~ dunif(0,1) # movement out of LCR by interval for small adults
-    m[i,2] ~ dunif(0,1) # movement out of LCR by interval for large adults
-    m[i,3] ~ dunif(0,1) # movement into the LCR by interval for small adults
-    m[i,4] ~ dunif(0,1) # movement into the LCR by interval for large adults
-    
-    # tr is an array representing markov transitions for three intervals. some
-    # transitions are assumed to be zero (e.g., transitioning from a large to a
-    # small adult)
-    tr[1,i,1] <- s[i,1] * (1 - g[i,1]) * (1 - m[i,1])
-    tr[1,i,2] <- s[i,1] * g[i,1] * (1 - m[i,2])
-    tr[1,i,3] <- s[i,1] * (1 - g[i,1]) * m[i,1] * tau
-    tr[1,i,4] <- s[i,1] * g[i,1] * m[i,2] * tau
-    tr[1,i,5] <- s[i,1] * (1 - g[i,1]) * m[i,1] * (1 - tau)
-    tr[1,i,6] <- s[i,1] * g[i,1] * m[i,2] * (1 - tau)
-    tr[1,i,7] <- 1 - s[i,1]
-    tr[2,i,1] <- 0
-    tr[2,i,2] <- s[i,2] * (1 - m[i,2])
-    tr[2,i,3] <- 0
-    tr[2,i,4] <- s[i,2] * m[i,2] * tau
-    tr[2,i,5] <- 0
-    tr[2,i,6] <- s[i,2] * m[i,2] * (1 - tau)
-    tr[2,i,7] <- 1 - s[i,2]
-    tr[3,i,1] <- s[i,3] * (1 - g[i,2]) * m[i,3]
-    tr[3,i,2] <- s[i,3] * g[i,2] * m[i,4]
-    tr[3,i,3] <- s[i,3] * (1 - g[i,2]) * (1 - m[i,3])
-    tr[3,i,4] <- s[i,3] * g[i,2] * (1 - m[i,4])
-    tr[3,i,5] <- 0
-    tr[3,i,6] <- 0
-    tr[3,i,7] <- 1 - s[i,3]
-    tr[4,i,1] <- 0
-    tr[4,i,2] <- s[i,4] * m[i,4]
-    tr[4,i,3] <- 0
-    tr[4,i,4] <- s[i,4] * (1 - m[i,4])
-    tr[4,i,5] <- 0
-    tr[4,i,6] <- 0
-    tr[4,i,7] <- 1 - s[i,4]
-    tr[5,i,1] <- tr[3,i,1]
-    tr[5,i,2] <- tr[3,i,2]
-    tr[5,i,3] <- 0
-    tr[5,i,4] <- 0
-    tr[5,i,5] <- tr[3,i,3]
-    tr[5,i,6] <- tr[3,i,4]
-    tr[5,i,7] <- tr[3,i,7]
-    tr[6,i,1] <- 0
-    tr[6,i,2] <- tr[4,i,2]
-    tr[6,i,3] <- 0
-    tr[6,i,4] <- 0
-    tr[6,i,5] <- 0
-    tr[6,i,6] <- tr[4,i,4]
-    tr[6,i,7] <- tr[4,i,7]
-    for(j in 1:6){
-      tr[7,i,j] <- 0
+  for(j in 1:3){
+    for(k in 1:4){
+      logit(bphi[j,k]) <- lphi[j,k]
     }
-    tr[7,i,7] <- 1
-  }	
-  
-  # p is the matrix describing capture probabilities
-  # Diagonal values represent capture probabilities for the four states
-  # The fifth column represents the probability a fish is not captured
-  # Note that for fish in states 5-6 (unobserveable sites in the CR that are not sampled)
-  # and for state 7 (dead state) the probability a fish is unobserved is 100%
-  for(i in 1:22){
-    p[1,LCRs[i],1] ~ dunif(0, 1)
-    p[2,LCRs[i],2] ~ dunif(0, 1)
   }
   
-  # No sampling in LCR during 1st, 4th, 7th, 10th recap periods (summers of 2009 - 2012)
+  bpsi2 ~ dunif(0,1) # growth of size class 2 fish into size class 3
+  
+  # define transition matrix that combines survival and growth parameters
   for(i in 1:4){
-    p[1,LCRns[i],1] <- 0
-    p[2,LCRns[i],2] <- 0
-  }
-  for(i in 1:24){
-    p[3,CRs[i],3] ~ dunif(0, 1)
-    p[4,CRs[i],4] ~ dunif(0, 1)
+    btrans[1,3,i] <- 0
+    btrans[1,4,i] <- 1 - bphi[1,i]
+    btrans[2,1,i] <- 0
+    btrans[2,2,i] <- bphi[2,i] * (1 - bpsi2)
+    btrans[2,3,i] <- bphi[2,i] * bpsi2
+    btrans[2,4,i] <- 1 - bphi[2,i]
+    btrans[3,1,i] <- 0
+    btrans[3,2,i] <- 0
+    btrans[3,3,i] <- bphi[3,i]
+    btrans[3,4,i] <- 1 - bphi[3,i]
+    btrans[4,1,i] <- 0
+    btrans[4,2,i] <- 0
+    btrans[4,3,i] <- 0
+    btrans[4,4,i] <- 1
   }
   
-  # No sampling in CR during 3rd and 6th recap periods (spring of 2010 & 2011)
-  for(i in 1:2){
-    p[3,CRns[i],3] <- 0
-    p[4,CRns[i],4] <- 0
+  # size class one transitions are done separately because growth is allowed to vary between seasons
+  for(i in 1:3){
+    bpsi1[i] ~ dunif(0,1)
+    btrans[1,1,i] <- bphi[1,i] * (1 - bpsi1[i])
+    btrans[1,2,i] <- bphi[1,i] * bpsi1[i]
   }
   
-  for(i in 1:26){
-    p[1,i,2] <- 0
-    p[1,i,3] <- 0
-    p[1,i,4] <- 0
-    p[1,i,5] <- 1 - p[1,i,1]
-    p[2,i,1] <- 0
-    p[2,i,3] <- 0
-    p[2,i,4] <- 0
-    p[2,i,5] <- 1 - p[2,i,2]
-    p[3,i,1] <- 0
-    p[3,i,2] <- 0
-    p[3,i,4] <- 0
-    p[3,i,5] <- 1 - p[3,i,3]
-    p[4,i,1] <- 0
-    p[4,i,2] <- 0
-    p[4,i,3] <- 0
-    p[4,i,5] <- 1 - p[4,i,4]
-    p[5,i,1] <- 0
-    p[5,i,2] <- 0
-    p[5,i,3] <- 0
-    p[5,i,4] <- 0
-    p[5,i,5] <- 1
-    p[6,i,1] <- 0
-    p[6,i,2] <- 0
-    p[6,i,3] <- 0
-    p[6,i,4] <- 0
-    p[6,i,5] <- 1
-    p[7,i,1] <- 0
-    p[7,i,2] <- 0
-    p[7,i,3] <- 0
-    p[7,i,4] <- 0
-    p[7,i,5] <- 1
+  btrans[1,1,4] <- 0
+  btrans[1,2,4] <- bphi[1,4]
+  
+  bpi <- .08 # proportion of brown trout population in NO reach 1
+  tau_blp <- pow(sd_blp, -2)
+  sd_blp ~ dunif(0.1, 2) # trip to trip deviation in NO pcaps
+  
+  # mean pcaps per pass on a logit scale for three size classes, plus largest
+  # size class during spawning season
+  for(i in 1:4){
+    mu_blp[i] ~ dnorm(-3, .25) 
+  }
+  
+  # this loop calculates actual per pass pcaps for each trip and modifies based on # of passes  
+  for(j in 1:23){
+    blp_pass[j,1] ~ dnorm(mu_blp[1], tau_blp)
+    blp_pass[j,2] ~ dnorm(mu_blp[2], tau_blp)
+    blp_pass[j,3] ~ dnorm(mu_blp[spawn[j]], tau_blp)
+    
+    for(k in 1:3){
+      logit(bp_pass[j,k]) <- blp_pass[j,k]
+      bp[j,k,k] <- 1 - pow((1 - bp_pass[j,k]), NOpasses[j])
+      bp[j,k,4] <- 1 - bp[j,k,k]
+    }
+    
+    bp[j,1,2] <- 0
+    bp[j,1,3] <- 0
+    bp[j,2,1] <- 0
+    bp[j,2,3] <- 0
+    bp[j,3,1] <- 0
+    bp[j,3,2] <- 0
+    bp[j,4,1] <- 0
+    bp[j,4,2] <- 0
+    bp[j,4,3] <- 0
+    bp[j,4,4] <- 1
   }
   
   for(k in 1:NindCH){
-    z[k,indf[k]] = indCH[k,indf[k]]
-    for(i in (indf[k] + 1):indl[k]){
-      z[k,i] ~ dcat(tr[z[k,i - 1], season[i - 1],])
-      indCH[k,i] ~ dcat(p[z[k,i], i - 1,])
+    Z[k,indf[k]] <- indCH[k,indf[k]]    
+    for(j in indf[k]:(indlast[k] - 1)){
+      Z[k,(j + 1)] ~ dcat(btrans[Z[k,j], ,seasNO[(j + 1)]])
+      indCH[k,(j + 1)] ~ dcat(bp[j,Z[k,(j + 1)],])
     }
   }
+  
+  # calculate offset for each size classes of AZGF effort and calculate expected pcap
+  AZadj[1] ~ dnorm(0,1)
+  AZadj[2] ~ dnorm(0,1)
+  AZadj[3] ~ dnorm(0,1)
+  mu_AZ[1] <- mu_blp[1] + AZadj[1]
+  mu_AZ[2] <- mu_blp[2] + AZadj[2]
+  mu_AZ[3] <- mu_blp[3] + AZadj[3]
+  IN[1] <- 0 # initial abundances of size class 1 fish
+  IN[2] ~ dunif(0, 1000) # initial abundances of size class 2 fish
+  IN[3] ~ dunif(0, 1000) # initial abundances of size class 3 fish
+  bN[1,1] <- IN[1]
+  bN[1,2] <- IN[2]
+  bN[1,3] <- IN[3]
+  
+  # variance term controlling unexplained variation in reproductive rate (BETA) 
+  tau_beta <- pow(sd_beta,-2)
+  sd_beta ~ dunif(0.1,4)
+  
+  # log of the median reproductive rate - i.e., an intercept
+  lbeta_0 ~ dunif(-6,0)
+  
+  # log of the median immigration rate of large brown trout - i.e., the intercept
+  mu_I ~ dunif(0,6)
+  
+  # variance term controlling unexplained variation in immigration
+  tau_I <- pow(sd_I,-2)
+  sd_I ~ dunif(0.01,3)
+  
+  # calculate actual immigration in each interval on log scale
+  for(j in 1:68){
+    I[j] ~ dnorm(mu_I, tau_I)
+  }
+  
+  # calculate latent abundance of brown trout from fall 2000 to end of 2017
+  for (j in 1:17){
+    for (k in 1:3){
+      bN[((j-1) * 4 + k + 1),1] <- btrans[1,1,k] * bN[((j-1) * 4 + k),1]
+      bN[((j-1) * 4 + k + 1),2] <- btrans[1,2,k] * bN[((j-1) * 4 + k),1] + btrans[2,2,k] * bN[((j-1) * 4 + k),2]
+      bN[((j-1) * 4 + k + 1),3] <- btrans[2,3,k] * bN[((j-1) * 4 + k),2] + btrans[3,3,k] * bN[((j-1) * 4 + k),3] + exp(I[((j-1) * 4 + k)])
+    }
+    
+    # BNT recruits produced in fall as a function weighted sum of adults (wA) and reprodutive rate (Beta) in winter
+    wA[j] <- (bN[((j - 1) * 4 + 2),2] + 4 * bN[((j - 1) * 4 + 2),3])
+    beta_eps[j] ~ dnorm(0, tau_beta)
+    Beta[j] <- exp(lbeta_0 + beta_eps[j]) 
+    
+    # between summer and fall all bnt graduate to sz 2 & recruits show up
+    bN[(1 + j * 4),1] <- wA[j] * Beta[j]
+    bN[(1 + j * 4),2] <- btrans[1,2,4] * bN[(j * 4),1] + btrans[2,2,4] * bN[(j * 4),2]
+    bN[(1 + j * 4),3] <- btrans[2,3,4] * bN[(j * 4),2] + btrans[3,3,4] * bN[(j * 4),3] + exp(I[(j * 4)])
+  }
+  
+  # 2000 - 2017 AZGF data
+  for(j in 1:NAZsamps){
+    for(k in 1:3){
+      blpAZ[j,k] ~ dnorm(mu_AZ[k], tau_blp)
+      logit(bpAZ[j,k]) <- blpAZ[j,k]
+      blamAZ[j,k] <- bpAZ[j,k] * bN[ts[j],k] * AZeff[j] / 35 # predicted catch AZ (35 is ~h to do LF, by AZ)
+      bAZ[j,k] ~ dpois(blamAZ[j,k])
+    }
+  }
+  
+  # 2012 - 2017 NO: starts in april 2012
+  for(j in 1:23){
+    for(k in 1:3){
+      blamNO[j,k] <- bp[j,k,k] * bpi * bN[(j + 46),k]
+      bNOc[j,k] ~ dpois(blamNO[j,k])
+    }
+  }
+  
 }
-
-    ",fill=TRUE)
-sink() 
+    ", fill = TRUE)
+sink()
 
 #-----------------------------------------------------------------------------#
-JD.data <- list(LCRs = LCRs, LCRns = LCRns, CRs = CRs, CRns = CRns,
-                season = season, NindCH = dim(indCH)[1], indCH = indCH,
-                indf = indf, indl = indl, z = known.state)
+JD_inits <- function(){
+  z.init <- matrix(NA, nrow = NindCH, ncol = 23)
+  for(i in 1:NindCH){
+    z.init[i,indf[i]] <- indCH[i,indf[i]]
+    for(j in (indf[i] + 1):indlast[i]){
+      z.init[i,j] <- ifelse(indCH[i,j] < 4, indCH[i,j],
+                            ifelse(z.init[i,(j - 1)] > 1, z.init[i,(j - 1)],
+                                   ifelse(seasNO[j] == 4, 2, 1)))
+    }
+    z.init[i,indf[i]] <- NA
+  }	
+  list(Z = array(z.init, dim = c(NindCH, 23)))
+}
 
-JD.par <- c('s_i', 'g', 'm', 'tau')
+#-----------------------------------------------------------------------------#
+BM_JM.data <- list(NAZsamps = NAZsamps, ts = ts, AZeff = AZeff, bAZ = bAZ,
+                   seasNO = seasNO, bNOc = bNOc, NOpasses = NOpasses, 
+                   indlast = indlast, indCH = indCH, NindCH = NindCH, indf = indf,
+                   spawn = spawn)
 
-JD.inits <- function(){
-  list(s_i = c(.7, .7, .7, .7), z = array(z.init, dim = c(dim(indCH)[1], 27)))
-  }
+BM_JM.par <- c('bphi', 'bpsi1', 'bpsi2', 'mu_blp', 'sd_blp', 'lbeta_0',
+               'mu_I', 'I', 'Beta', 'IN', 'AZadj', 'sd_I', 'sd_lphi',
+               'sd_beta', 'bN', 'bp_pass')
 
-JD.out <- jags.parallel(JD.data, inits = JD.inits, JD.par, ".\\JAGS_Discrete_chub.txt",
-                        n.chains = 1, n.iter = 10, export_obj_names = "z.init")
-
+jags.fit <- jags.parallel(BM_JM.data, inits = JD_inits, BM_JM.par, "JAGS_Discrete.jags",
+                          n.chains = 3, n.iter = 10, export_obj_names = c("JD_inits"))
 #-----------------------------------------------------------------------------#
 ###############################################################################
 #                                                                     Spring 19
-# Multi-state Capture-Recapture model (Humpback Chub)
-# JAGS Marginalized Version
+#  Fitting an Integrated Population Model to Brown Trout Data
+#  Marginalized JAGS version 
 #
 #  Notes:
+#  * The model runs from the fall of 2000 to fall of 2017 on a seasonal basis
+#  * We define three size states based on total length in mm 
+#    - 0 - 200; 200 - 350; 350 +
 #  * Need to set directory for data
-#  * See Notes above
+#  * Need to supply JAGS/WinBUGS/Stan settings
+#
 ###############################################################################
 library(R2jags)
 
-# Get data:
-dat <- read.csv(".//HBC_data.csv")
-#-----------------------------------------------------------------------------#
-#  Functions:
-#	Get first capture occasion:
-find.first <- function(x){min(which(x != 5))}
-
-#	Get last capture occasion:
-find.last <- function(x){
-  ifelse(length(which(x != 5)) == 1, 27, max(which(x != 5)))
-  }
+# read in data
+NO_catch <- read.csv(paste0(getwd(), "/Data/", "NO_catch.csv"), header = TRUE)
+AZGF_catch <- read.csv(paste0(getwd(), "/Data/", "AZGF_catch.csv"), header = TRUE)
+MR_data <- read.csv(paste0(getwd(), "/Data/", "bCH.csv"), header = FALSE)
 
 #-----------------------------------------------------------------------------#
-# format data for model fitting:
-sumCH <- as.matrix(dat[,1:27])
-sumFR <- dat[,28]
-newtag.AO <- dat[,29]
+# extract/reformat data
+bNOc <- NO_catch[,1:3]
+NOpasses <- NO_catch$NOpasses
+seasNO <- NO_catch$seasNO
+spawn <- ifelse(seasNO == 1, 4, 3)
+bAZ <- AZGF_catch[,1:3]
+ts <- AZGF_catch$ts
+AZeff <- AZGF_catch$AZeff
+NAZsamps <- length(AZeff)
 
-# other data:
-season <- c(rep(1:3, 8), 1:2) # season index
-LCRs <- c(2, 3, 5, 6, 8, 9, 11:26)
-LCRns <- c(1, 4, 7, 10)
-CRs <- c(1, 2, 4, 5, 7:26)
-CRns <- c(3, 6)
-catch <- matrix(c(287, 545, 221, 594, 215, 413, 500, 374, 562,
-                 193, 356, 171, 191, 111, 239, 259, 283, 246,
-                 102, 129, 154, 54, 63, 48, 36, 41, 35,
-                 35, 86, 126, 41, 43, 59, 22, 26, 34), nrow = 4, byrow = TRUE)
+# capture-recapture data
+allCH <- MR_data[,1:23]
 
-# Get first and last capture occasion for line in summarized capture history
-fc <- apply(sumCH, 1, find.first)
-lc <- apply(sumCH, 1, find.last)
+bCH = collapse.ch(allCH)[[1]]
+FR = collapse.ch(allCH)[[2]]
 
-# Use this to calculate abundance in code:
-CR_ind <- matrix(0, nrow = 4, ncol = 9)
-1 -> CR_ind[3:4,]
+findlast <- function(x){ifelse(x[23] == 1, 22, max(which(x[1:22] != 4)))}
+last <- apply(bCH, 1, findlast)
+
+NCH <- length(last)
+findfirst <- function(x){which(x != 4)[1]}
+sumf <- apply(bCH, 1, findfirst)
 
 #-----------------------------------------------------------------------------#
-sink("JAGS_Marginalized_chub.txt")
+sink("JAGS_Marginalized.jags")
 cat("
 model{
+  # lphi is the logit of survival and is given a prior based on the Lorenzen
+  # function and the average mass of fish in each size class during each season.
+  # variation from the priod mode is determined by an estimated variance
+  # parameter (sd_lphi)
   
-  for(j in 1:4){
-    s_i[j] ~ dunif(0, 1) # 3 month survival rates for small and large adults in LCR and CR
-    s[1,j] <- s_i[j]     # 3 month survival for spring to summer interval
-    s[2,j] <- s_i[j]     # 3 month survival for summer to fall interval
-    s[3,j] <- s_i[j] * s_i[j] # 6 month survival for fall to spring interval
-  } 
+  lphi[1,1] ~ dnorm(1.08, tau_lphi)
+  lphi[1,2] ~ dnorm(1.14, tau_lphi)
+  lphi[1,3] ~ dnorm(1.26, tau_lphi)
+  lphi[1,4] ~ dnorm(1.38, tau_lphi)
+  lphi[2,1] ~ dnorm(1.96, tau_lphi)
+  lphi[2,2] ~ dnorm(1.96, tau_lphi)
+  lphi[2,3] ~ dnorm(2.02, tau_lphi)
+  lphi[2,4] ~ dnorm(2.02, tau_lphi)
+  lphi[3,1] ~ dnorm(2.29, tau_lphi)
+  lphi[3,2] ~ dnorm(2.29, tau_lphi)
+  lphi[3,3] ~ dnorm(2.29, tau_lphi)
+  lphi[3,4] ~ dnorm(2.29, tau_lphi)
+  tau_lphi <- pow(sd_lphi, -2)
+  sd_lphi ~ dunif(0.01,4)
   
-  tau ~ dunif(0, 1) # proportion of adults in the observable portion of the LCR
-  for(i in 1:3){
-    g[i,1] ~ dunif(0, 1) # LCR growth for three intervals
-    g[i,2] ~ dunif(0, 1) # CR growth for three intervals
-    m[i,1] ~ dunif(0, 1) # movement out of LCR by interval for small adults
-    m[i,2] ~ dunif(0, 1) # movement out of LCR by interval for large adults
-    m[i,3] ~ dunif(0, 1) # movement into the LCR by interval for small adults
-    m[i,4] ~ dunif(0, 1) # movement into the LCR by interval for large adults
-    
-    # tr is an array representing markov transitions for three intervals. some
-    # transitions are assumed to be zero (e.g., transitioning from a large to a
-    # small adult)
-    tr[1,i,1] <- s[i,1] * (1 - g[i,1]) * (1 - m[i,1])
-    tr[1,i,2] <- s[i,1] * g[i,1] * (1 - m[i,2])
-    tr[1,i,3] <- s[i,1] * (1 - g[i,1]) * m[i,1] * tau
-    tr[1,i,4] <- s[i,1] * g[i,1] * m[i,2] * tau
-    tr[1,i,5] <- s[i,1] * (1 - g[i,1]) * m[i,1] * (1 - tau)
-    tr[1,i,6] <- s[i,1] * g[i,1] * m[i,2] * (1 - tau)
-    tr[1,i,7] <- 1 - s[i,1]
-    tr[2,i,1] <- 0
-    tr[2,i,2] <- s[i,2] * (1 - m[i,2])
-    tr[2,i,3] <- 0
-    tr[2,i,4] <- s[i,2] * m[i,2] * tau
-    tr[2,i,5] <- 0
-    tr[2,i,6] <- s[i,2] * m[i,2] * (1 - tau)
-    tr[2,i,7] <- 1 - s[i,2]
-    tr[3,i,1] <- s[i,3] * (1 - g[i,2]) * m[i,3]
-    tr[3,i,2] <- s[i,3] * g[i,2] * m[i,4]
-    tr[3,i,3] <- s[i,3] * (1 - g[i,2]) * (1 - m[i,3])
-    tr[3,i,4] <- s[i,3] * g[i,2] * (1 - m[i,4])
-    tr[3,i,5] <- 0
-    tr[3,i,6] <- 0
-    tr[3,i,7] <- 1 - s[i,3]
-    tr[4,i,1] <- 0
-    tr[4,i,2] <- s[i,4] * m[i,4]
-    tr[4,i,3] <- 0
-    tr[4,i,4] <- s[i,4] * (1 - m[i,4])
-    tr[4,i,5] <- 0
-    tr[4,i,6] <- 0
-    tr[4,i,7] <- 1 - s[i,4]
-    tr[5,i,1] <- tr[3,i,1]
-    tr[5,i,2] <- tr[3,i,2]
-    tr[5,i,3] <- 0
-    tr[5,i,4] <- 0
-    tr[5,i,5] <- tr[3,i,3]
-    tr[5,i,6] <- tr[3,i,4]
-    tr[5,i,7] <- tr[3,i,7]
-    tr[6,i,1] <- 0
-    tr[6,i,2] <- tr[4,i,2]
-    tr[6,i,3] <- 0
-    tr[6,i,4] <- 0
-    tr[6,i,5] <- 0
-    tr[6,i,6] <- tr[4,i,4]
-    tr[6,i,7] <- tr[4,i,7]
-    for (j in 1:6){
-      tr[7,i,j] <- 0
+  for(j in 1:3){
+    for(k in 1:4){
+      logit(bphi[j,k]) <- lphi[j,k]
     }
-    tr[7,i,7] <- 1
-  }	
-  
-  # p is the matrix describing capture probabilities
-  # Diagonal values represent capture probabilities for the four states
-  # The fifth column represents the probability a fish is not captured
-  # Note that for fish in states 5-6 (unobserveable sites in the CR that are not sampled)
-  # and for state 7 (dead state) the probability a fish is unobserved is 100%
-  for(i in 1:22){
-    p[1,LCRs[i],1] ~ dunif(0, 1)
-    p[2,LCRs[i],2] ~ dunif(0, 1)
   }
   
-  # No sampling in LCR during 1st, 4th, 7th, 10th recap periods (summers of 2009 - 2012)
+  bpsi2 ~ dunif(0,1) # growth of size class 2 fish into size class 3
+  
+  # define transition matrix that combines survival and growth parameters
   for(i in 1:4){
-    p[1,LCRns[i],1] <- 0
-    p[2,LCRns[i],2] <- 0
-  }
-  for(i in 1:24){
-    p[3,CRs[i],3] ~ dunif(0, 1)
-    p[4,CRs[i],4] ~ dunif(0, 1)
-  }
-  
-  # No sampling in CR during 3rd and 6th recap periods (spring of 2010 & 2011)
-  for(i in 1:2){
-    p[3,CRns[i],3] <- 0
-    p[4,CRns[i],4] <- 0
-  }
-  
-  for(i in 1:26){
-    p[1,i,2] <- 0
-    p[1,i,3] <- 0
-    p[1,i,4] <- 0
-    p[1,i,5] <- 1 - p[1,i,1]
-    p[2,i,1] <- 0
-    p[2,i,3] <- 0
-    p[2,i,4] <- 0
-    p[2,i,5] <- 1 - p[2,i,2]
-    p[3,i,1] <- 0
-    p[3,i,2] <- 0
-    p[3,i,4] <- 0
-    p[3,i,5] <- 1 - p[3,i,3]
-    p[4,i,1] <- 0
-    p[4,i,2] <- 0
-    p[4,i,3] <- 0
-    p[4,i,5] <- 1 - p[4,i,4]
-    p[5,i,1] <- 0
-    p[5,i,2] <- 0
-    p[5,i,3] <- 0
-    p[5,i,4] <- 0
-    p[5,i,5] <- 1
-    p[6,i,1] <- 0
-    p[6,i,2] <- 0
-    p[6,i,3] <- 0
-    p[6,i,4] <- 0
-    p[6,i,5] <- 1
-    p[7,i,1] <- 0
-    p[7,i,2] <- 0
-    p[7,i,3] <- 0
-    p[7,i,4] <- 0
-    p[7,i,5] <- 1
+    btrans[1,3,i] <- 0
+    btrans[1,4,i] <- 1 - bphi[1,i]
+    btrans[2,1,i] <- 0
+    btrans[2,2,i] <- bphi[2,i] * (1 - bpsi2)
+    btrans[2,3,i] <- bphi[2,i] * bpsi2
+    btrans[2,4,i] <- 1 - bphi[2,i]
+    btrans[3,1,i] <- 0
+    btrans[3,2,i] <- 0
+    btrans[3,3,i] <- bphi[3,i]
+    btrans[3,4,i] <- 1 - bphi[3,i]
+    btrans[4,1,i] <- 0
+    btrans[4,2,i] <- 0
+    btrans[4,3,i] <- 0
+    btrans[4,4,i] <- 1
   }
   
-  # The 0.03 is to account for one-time 3% tag loss
-  for(k in 1:NsumCH){
-    pz[k,sumf[k],1] <- equals(sumCH[k,sumf[k]], 1) * (1 - 0.03 * newtag[k]) 
-    pz[k,sumf[k],2] <- equals(sumCH[k,sumf[k]], 2) * (1 - 0.03 * newtag[k])
-    pz[k,sumf[k],3] <- equals(sumCH[k,sumf[k]], 3) * (1 - 0.03 * newtag[k])
-    pz[k,sumf[k],4] <- equals(sumCH[k,sumf[k]], 4) * (1 - 0.03 * newtag[k])
-    pz[k,sumf[k],5] <- 0
-    pz[k,sumf[k],6] <- 0
-    pz[k,sumf[k],7] <- 0.03 * newtag[k]
-    for(i in sumf[k]:(lc[k] - 1)){
-      for(j in 1:7){
-        pz[k,(i + 1),j] <- inprod(pz[k,i,], tr[,season[i],j]) * p[j,i,sumCH[k,(i + 1)]]
+  # size class one transitions are done separately because growth is allowed to vary between seasons
+  for(i in 1:3){
+    bpsi1[i] ~ dunif(0,1)
+    btrans[1,1,i] <- bphi[1,i] * (1 - bpsi1[i])
+    btrans[1,2,i] <- bphi[1,i] * bpsi1[i]
+  }
+  
+  btrans[1,1,4] <- 0
+  btrans[1,2,4] <- bphi[1,4]
+  
+  bpi <- .08 # proportion of brown trout population in NO reach 1
+  tau_blp <- pow(sd_blp, -2)
+  sd_blp ~ dunif(0.1, 2) # trip to trip deviation in NO pcaps
+  
+  for(i in 1:4){
+    mu_blp[i] ~ dnorm(-3, .25) # mean pcaps per pass on a logit scale for three size classes, plus largest size class during spawning season
+  }
+  
+  # this loop calculates actual per pass pcaps for each trip and modifies based on # of passes  
+  for(j in 1:23){
+    # spawn[j] <- 3 + step(-1 * seasNO[j] + 1.1)  # change here to use 'spawn' input
+    blp_pass[j,1] ~ dnorm(mu_blp[1], tau_blp)
+    blp_pass[j,2] ~ dnorm(mu_blp[2], tau_blp)
+    blp_pass[j,3] ~ dnorm(mu_blp[spawn[j]], tau_blp)
+    
+    for(k in 1:3){
+      logit(bp_pass[j,k]) <- blp_pass[j,k]
+      bp[j,k,k] <- 1 - pow((1 - bp_pass[j,k]), NOpasses[j])
+      bp[j,k,4] <- 1 - bp[j,k,k]
+    }
+    
+    bp[j,1,2] <- 0
+    bp[j,1,3] <- 0
+    bp[j,2,1] <- 0
+    bp[j,2,3] <- 0
+    bp[j,3,1] <- 0
+    bp[j,3,2] <- 0
+    bp[j,4,1] <- 0
+    bp[j,4,2] <- 0
+    bp[j,4,3] <- 0
+    bp[j,4,4] <- 1
+  }
+  
+  for(k in 1:NCH){
+    pz[k,sumf[k],1] <- equals(bCH[k,sumf[k]], 1)
+    pz[k,sumf[k],2] <- equals(bCH[k,sumf[k]], 2)
+    pz[k,sumf[k],3] <- equals(bCH[k,sumf[k]], 3)
+    pz[k,sumf[k],4] <- 0
+    
+    for(j in sumf[k]:(last[k] - 1)){
+      for(i in 1:4){
+        pz[k,(j + 1),i] <- inprod(pz[k,j,], btrans[,i,seasNO[(j + 1)]]) * bp[j,i,bCH[k,(j + 1)]]
       }
     }
     
-    lik[k] <- sum(pz[k,lc[k],])
-    one[k] ~ dbin(lik[k], sumFR[k])
+    ll[k] <- sum(pz[k, last[k],])
+    ones[k] ~ dbin(ll[k], FR[k])
   }
   
-  # Calculate abundance from catch by simulating from a negative binomial distribution:
-  for(i in 1:4){
-    for(j in 1:9){
-      p_fall[i,j] <- p[i,fall_ind[j],i] * (1 - CR_ind[i,j] * (1 - tau))
-      U[i,j] ~ dnegbin(p_fall[i,j], catch[i,j])
-      N[i,j] = catch[i,j] + U[i,j] 
+  # calculate offset for each size classes of AZGF effort and calculate expected pcap
+  AZadj[1] ~ dnorm(0,1)
+  AZadj[2] ~ dnorm(0,1)
+  AZadj[3] ~ dnorm(0,1)
+  mu_AZ[1] <- mu_blp[1] + AZadj[1]
+  mu_AZ[2] <- mu_blp[2] + AZadj[2]
+  mu_AZ[3] <- mu_blp[3] + AZadj[3]
+  IN[1] <- 0 # initial abundances of size class 1 fish
+  IN[2] ~ dunif(0, 1000) # initial abundances of size class 2 fish
+  IN[3] ~ dunif(0, 1000) # initial abundances of size class 3 fish
+  bN[1,1] <- IN[1]
+  bN[1,2] <- IN[2]
+  bN[1,3] <- IN[3]
+  
+  # variance term controlling unexplained variation in reproductive rate (BETA) 
+  tau_beta <- pow(sd_beta,-2)
+  sd_beta ~ dunif(0.1,4)
+  
+  # log of the median reproductive rate - i.e., an intercept
+  lbeta_0 ~ dunif(-6,0)
+  
+  # log of the median immigration rate of large brown trout - i.e., the intercept
+  mu_I ~ dunif(0,6)
+  
+  # variance term controlling unexplained variation in immigration
+  tau_I <- pow(sd_I,-2)
+  sd_I ~ dunif(0.01,3)
+  
+  # calculate actual immigration in each interval on log scale
+  for(j in 1:68){
+    I[j] ~ dnorm(mu_I, tau_I)
+  }
+  
+  # calculate latent abundance of brown trout from fall 2000 to end of 2017
+  for(j in 1:17){
+    for(k in 1:3){
+      bN[((j-1) * 4 + k + 1),1] <- btrans[1,1,k] * bN[((j-1) * 4 + k),1]
+      bN[((j-1) * 4 + k + 1),2] <- btrans[1,2,k] * bN[((j-1) * 4 + k),1] + btrans[2,2,k] * bN[((j-1) * 4 + k),2]
+      bN[((j-1) * 4 + k + 1),3] <- btrans[2,3,k] * bN[((j-1) * 4 + k),2] + btrans[3,3,k] * bN[((j-1) * 4 + k),3] + exp(I[((j-1) * 4 + k)])
+    }
+    
+    # BNT recruits produced in fall as a function weighted sum of adults (wA) and reprodutive rate (Beta) in winter
+    wA[j] <- (bN[((j - 1) * 4 + 2),2] + 4 * bN[((j - 1) * 4 + 2),3])
+    beta_eps[j] ~ dnorm(0, tau_beta)
+    Beta[j] <- exp(lbeta_0 + beta_eps[j]) 
+    
+    # between summer and fall all bnt graduate to sz 2 & recruits show up
+    bN[(1 + j * 4),1] <- wA[j] * Beta[j]
+    bN[(1 + j * 4),2] <- btrans[1,2,4] * bN[(j * 4),1] + btrans[2,2,4] * bN[(j * 4),2]
+    bN[(1 + j * 4),3] <- btrans[2,3,4] * bN[(j * 4),2] + btrans[3,3,4] * bN[(j * 4),3] + exp(I[(j * 4)])
+  }
+  
+  # 2000 - 2017 AZGF data
+  for(j in 1:NAZsamps){
+    for(k in 1:3){
+      blpAZ[j,k] ~ dnorm(mu_AZ[k], tau_blp)
+      logit(bpAZ[j,k]) <- blpAZ[j,k]
+      blamAZ[j,k] <- bpAZ[j,k] * bN[ts[j],k] * AZeff[j] / 35 # predicted catch AZ (35 is ~h to do LF, by AZ)
+      bAZ[j,k] ~ dpois(blamAZ[j,k])
+    }
+  }
+  
+  # 2012 - 2017 NO: starts in april 2012
+  for(j in 1:23){
+    for(k in 1:3){
+      blamNO[j,k] <- bp[j,k,k] * bpi * bN[(j + 46),k]
+      bNOc[j,k] ~ dpois(blamNO[j,k])
     }
   }
 }
-
-    ",fill=TRUE)
-sink() 
-
+",fill=TRUE)
+sink()
 #-----------------------------------------------------------------------------#
-JM.data <- list(LCRs = LCRs, LCRns = LCRns, CRs = CRs, CRns = CRns,
-                season = season, NsumCH = dim(sumCH)[1],
-                sumCH = array(sumCH, dim = c(dim(sumCH)[1], dim(sumCH)[2])),
-                newtag = as.vector(newtag.AO), sumf = as.vector(fc),
-                sumFR = sumFR, one = sumFR,  
-                CR_ind = array(CR_ind, dim = c(dim(CR_ind)[1], dim(CR_ind)[2])),
-                lc = as.vector(lc), fall_ind = 1:9 * 3 - 1,
-                catch = array(catch, dim = c(dim(catch)[1], dim(catch)[2])))
+BM_JM.data <- list(NAZsamps = NAZsamps, ts = ts, AZeff = AZeff, bAZ = bAZ,
+                   seasNO = seasNO, bNOc = bNOc, NOpasses = NOpasses, ones = FR,
+                   FR = FR, last = last, bCH = bCH, NCH = NCH, sumf = sumf,
+                   spawn = spawn)
 
-JM.par <- c('s_i', 'g', 'm', 'tau', 'p_cr', 'p_lcr', 'N')
+BM_JM.par <- c('bphi', 'bpsi1', 'bpsi2', 'mu_blp', 'sd_blp', 'lbeta_0',
+               'mu_I', 'I', 'Beta', 'IN', 'AZadj', 'sd_I', 'sd_lphi',
+               'sd_beta', 'bN', 'bp_pass')
 
-JM.inits <- function(){list(s_i = c(.7, .7, .7, .7))}
-
-JM.out <- jags.parallel(JM.data, inits = JM.inits, JM.par,
-                        ".\\JAGS_Marginalized_chub.txt", n.cluster = 3,
-                        n.chains = 1, n.iter = 10)
+jags.fit <- jags.parallel(BM_JM.data, inits = NULL, BM_JM.par, "JAGS_Marginalized.jags",
+                          n.chains = 3, n.iter = 10)
 #-----------------------------------------------------------------------------#
 ###############################################################################
 #                                                                     Spring 19
-# Multi-state Capture-Recapture model (Humpback Chub)
-# Stan Marginalized Version
+#  Fitting an Integrated Population Model to Brown Trout Data
+#  Marginalized Stan version 
 #
 #  Notes:
+#  * The model runs from the fall of 2000 to fall of 2017 on a seasonal basis
+#  * We define three size states based on total length in mm 
+#    - 0 - 200; 200 - 350; 350 +
 #  * Need to set directory for data
-#  * See Notes above
+#  * Need to supply JAGS/WinBUGS/Stan settings
+#
 ###############################################################################
 library(rstan)
-
-# To run Stan in parallel:
 rstan_options(auto_write = TRUE)
-options(mc.cores = parallel::detectCores())
+options(mc.cores = parallel::detectCores()) 
 
-# Get data:
-dat <- read.csv(".//HBC_data.csv")
-#-----------------------------------------------------------------------------#
-# Functions:
-#	Get first capture occasion:
-find.first <- function(x){min(which(x != 5))}
-
-#	Get last capture occasion:
-find.last <- function(x){
-  ifelse(length(which(x != 5)) == 1, 27, max(which(x != 5)))
-  }
+# read in data
+NO_catch <- read.csv(paste0(getwd(), "/Data/", "NO_catch.csv"), header = TRUE)
+AZGF_catch <- read.csv(paste0(getwd(), "/Data/", "AZGF_catch.csv"), header = TRUE)
+MR_data <- read.csv(paste0(getwd(), "/Data/", "bCH.csv"), header = FALSE)
 
 #-----------------------------------------------------------------------------#
-# format data for model fitting:
-sumCH <- as.matrix(dat[,1:27])
-sumFR <- dat[,28]
-newtag.AO <- dat[,29]
+# extract/reformat data
+bNOc <- as.matrix(NO_catch[,1:3])
+NOpasses <- NO_catch$NOpasses
+seasNO <- NO_catch$seasNO
+spawn <- ifelse(seasNO == 1, 4, 3)
+bAZ <- as.matrix(AZGF_catch[,1:3])
+ts <- AZGF_catch$ts
+AZeff <- AZGF_catch$AZeff
+NAZsamps <- length(AZeff)
 
-# other data:
-season <- c(rep(1:3, 8), 1:2) # season index
-LCRs <- c(2, 3, 5, 6, 8, 9, 11:26)
-LCRns <- c(1, 4, 7, 10)
-CRs <- c(1, 2, 4, 5, 7:26)
-CRns <- c(3, 6)
-catch <- matrix(c(287, 545, 221, 594, 215, 413, 500, 374, 562,
-                 193, 356, 171, 191, 111, 239, 259, 283, 246,
-                 102, 129, 154, 54, 63, 48, 36, 41, 35,
-                 35, 86, 126, 41, 43, 59, 22, 26, 34), nrow = 4, byrow = TRUE)
+# capture-recapture data
+allCH <- MR_data[,1:23]   
 
-# Get first and last capture occasion for line in summarized capture history
-fc <- apply(sumCH, 1, find.first)
-lc <- apply(sumCH, 1, find.last)
+bCH = collapse.ch(allCH)[[1]]
+FR = collapse.ch(allCH)[[2]]
 
-# Use this to calculate abundance in code:
-CR_ind <- matrix(0, nrow = 4, ncol = 9)
-1 -> CR_ind[3:4,]
+findlast <- function(x){ifelse(x[23] == 1, 22, max(which(x[1:22] != 4)))}
+last <- apply(bCH, 1, findlast)
+
+NCH <- length(last)
+findfirst <- function(x){which(x != 4)[1]}
+sumf <- apply(bCH, 1, findfirst)
+
 #-----------------------------------------------------------------------------#
-sink("Stan_Marginalized_chub.stan")
+sink("Stan_Marginalized.Stan")
 cat("
+// Marginalized Integrated Population Model - Brown Trout Data  
+    
 data{
-  int<lower = 1> NsumCH;
-  int<lower = 1, upper = 5> sumCH[NsumCH, 27];
-  int<lower = 1, upper = 26> sumf[NsumCH];
-  int<lower = 1, upper = 3> season[26];
-  int<lower = 1> sumFR[NsumCH];
-  int<lower = 1> LCRs [22];
-  int<lower = 1> LCRns [4];
-  int<lower = 1> CRs [24];
-  int<lower = 1> CRns [2];
-  int catch_mat[4,9];
-  int fall_ind[9];
-  int<lower = 0, upper = 1> newtag[NsumCH];
-  int<lower = 2, upper = 27> lc[NsumCH];
+  int NAZsamps;                   // Number of samples AGFD
+  int ts[NAZsamps];
+  vector [NAZsamps] AZeff;
+  int bAZ[NAZsamps, 3];
+  int seasNO[23];
+  int bNOc[23,3];
+  int NOpasses[23];              // Number of passes
+  int NCH;                       // Number of capture histories
+  int FR[NCH];
+  int last[NCH];
+  int bCH[NCH, 23];
+  int sumf[NCH];
+  int spawn[23];               // Indicator for spawning month
 }
 
 parameters{
-  real<lower = 0, upper = 1> s_i[4]; // 3 month survivals for small and large chub in LCR and CR
-  real<lower = 0, upper = 1> tau;    // proportion of CR adults residing in observable location
-  vector<lower = 0, upper = 1> [2] g [3]; // seasonal growth for two rivers
-  vector<lower = 0, upper = 1> [4] m [3]; // seasonal movement rates for 2 sizes and locations
-  vector<lower = 0, upper = 1> [2] p_lcr [22]; // recapture probability in LCR for two size classes
-  vector<lower = 0, upper = 1> [2] p_cr [24];  // recapture probability in CR for two size classes
+  matrix[3, 4]lphi;
+  real<lower = 0.01, upper = 4> sd_lphi;                  
+  real<lower = 0, upper = 1> bpsi2;
+  vector<lower = 0, upper = 1>[3] bpsi1;
+  real<lower = 0.1, upper = 2> sd_blp;
+  vector[4] mu_blp;
+  matrix[23, 3]blp_pass;
+  vector[3] AZadj;
+  vector<lower = 0, upper = 1000>[2] IN;
+  real<lower = 0.1, upper = 4> sd_beta;                  
+  vector[17] beta_eps;
+  real<lower = -6, upper = 0> lbeta_0;                                
+  real<lower = 0, upper = 6> mu_I;                                    
+  real<lower = 0.01, upper = 3> sd_I;
+  vector[68] I;
+  matrix[NAZsamps, 3]blpAZ;
 }
 
 transformed parameters{
-  vector<lower = 0, upper = 1> [4] s[3];
-  simplex[7] tr[7,3];
-  simplex[5] p[7,26];
+  matrix[3, 4]bphi;  
+  real btrans[4, 4, 4];                                                     
+  matrix[23,3]bp_pass;
+  real bp[23,4,4];                                                          
+  vector[3] mu_AZ;
+  matrix[69,3] bN;                                                          
+  vector[17] wA;
+  vector[17] Beta;
   
-  for(j in 1:4){
-    s[1,j] = s_i[j]; // 3 month survival for spring to summer interval
-    s[2,j] = s_i[j]; // 3 month survival for summer to fall interval
-    s[3,j] = s_i[j] * s_i[j]; // 6 month survival for fall to spring interval
-  } 
-  
-  for(i in 1:3){
-    tr[1,i,1] = s[i,1] * (1 - g[i,1]) * (1 - m[i,1]);
-    tr[1,i,2] = s[i,1] * g[i,1] * (1 - m[i,2]);
-    tr[1,i,3] = s[i,1] * (1 - g[i,1]) * m[i,1] * tau;
-    tr[1,i,4] = s[i,1] * g[i,1] * m[i,2] * tau;
-    tr[1,i,5] = s[i,1] * (1 - g[i,1]) * m[i,1] * (1 - tau);
-    tr[1,i,6] = s[i,1] * g[i,1] * m[i,2] * (1 - tau);
-    tr[1,i,7] = 1 - s[i,1];
-    tr[2,i,1] = 0;
-    tr[2,i,2] = s[i,2] * (1 - m[i,2]);
-    tr[2,i,3] = 0;
-    tr[2,i,4] = s[i,2] * m[i,2] * tau;
-    tr[2,i,5] = 0;
-    tr[2,i,6] = s[i,2] * m[i,2] * (1-tau);
-    tr[2,i,7] = 1 - s[i,2];
-    tr[3,i,1] = s[i,3] * (1 - g[i,2]) * m[i,3];
-    tr[3,i,2] = s[i,3] * g[i,2] * m[i,4];
-    tr[3,i,3] = s[i,3] * (1 - g[i,2]) * (1 - m[i,3]);
-    tr[3,i,4] = s[i,3] * g[i,2] * (1 - m[i,4]);
-    tr[3,i,5] = 0;
-    tr[3,i,6] = 0;
-    tr[3,i,7] = 1 - s[i,3];
-    tr[4,i,1] = 0;
-    tr[4,i,2] = s[i,4] * m[i,4];
-    tr[4,i,3] = 0;
-    tr[4,i,4] = s[i,4] * (1 - m[i,4]);
-    tr[4,i,5] = 0;
-    tr[4,i,6] = 0;
-    tr[4,i,7] = 1 - s[i,4];
-    tr[5,i,1] = tr[3,i,1];
-    tr[5,i,2] = tr[3,i,2];
-    tr[5,i,3] = 0;
-    tr[5,i,4] = 0;
-    tr[5,i,5] = tr[3,i,3];
-    tr[5,i,6] = tr[3,i,4];
-    tr[5,i,7] = tr[3,i,7];
-    tr[6,i,1] = 0;
-    tr[6,i,2] = tr[4,i,2];
-    tr[6,i,3] = 0;
-    tr[6,i,4] = 0;
-    tr[6,i,5] = 0;
-    tr[6,i,6] = tr[4,i,4];
-    tr[6,i,7] = tr[4,i,7];
-    for(j in 1:6){
-      tr[7,i,j] = 0;
+  for(j in 1:3){  // remove for no prior version
+    for(k in 1:4){
+      bphi[j,k] = inv_logit(lphi[j,k]);
     }
-    tr[7,i,7] = 1;
   }
   
-  for(i in 1:22){
-    p[1,LCRs[i],1] = p_lcr[i,1];
-    p[2,LCRs[i],2] = p_lcr[i,2];
-  }
-  // No sampling in LCR during 1st, 4th, 7th, 10th recap periods (summers of 2009 - 2012)
+  // define transition matrix that combines survival and growth parameters
   for(i in 1:4){
-    p[1,LCRns[i],1] = 0;
-    p[2,LCRns[i],2] = 0;
+    btrans[1,3,i] = 0;
+    btrans[1,4,i] = 1 - bphi[1,i];
+    btrans[2,1,i] = 0;
+    btrans[2,2,i] = bphi[2,i] * (1 - bpsi2);
+    btrans[2,3,i] = bphi[2,i] * bpsi2;
+    btrans[2,4,i] = 1 - bphi[2,i];
+    btrans[3,1,i] = 0;
+    btrans[3,2,i] = 0;
+    btrans[3,3,i] = bphi[3,i];
+    btrans[3,4,i] = 1 - bphi[3,i];
+    btrans[4,1,i] = 0;
+    btrans[4,2,i] = 0;
+    btrans[4,3,i] = 0;
+    btrans[4,4,i] = 1;
   }
-  for(i in 1:24){
-    p[3,CRs[i],3] = p_cr[i,1];
-    p[4,CRs[i],4] = p_cr[i,2];
+  
+  // size class one transitions are done separately because growth is allowed to vary between seasons
+  for(i in 1:3){
+    btrans[1,1,i] = bphi[1,i] * (1 - bpsi1[i]);
+    btrans[1,2,i] = bphi[1,i] * bpsi1[i];
   }
-  // No sampling in CR during 3rd and 6th recap periods (spring of 2010 & 2011)
-  for(i in 1:2){
-    p[3,CRns[i],3] = 0;
-    p[4,CRns[i],4] = 0;
+  
+  btrans[1,1,4] = 0;
+  btrans[1,2,4] = bphi[1,4];
+  
+  // this loop calculates actual per pass pcaps for each trip and modifies based on # of passes
+  for(j in 1:23){
+    for(k in 1:3){
+      bp_pass[j,k] = inv_logit(blp_pass[j,k]);
+      bp[j,k,k] = 1 - pow((1 - bp_pass[j,k]), NOpasses[j]);                 
+      bp[j,k,4] = 1 - bp[j,k,k];
+    }
+    
+    bp[j,1,2] = 0;
+    bp[j,1,3] = 0;
+    bp[j,2,1] = 0;
+    bp[j,2,3] = 0;
+    bp[j,3,1] = 0;
+    bp[j,3,2] = 0;
+    bp[j,4,1] = 0;
+    bp[j,4,2] = 0;
+    bp[j,4,3] = 0;
+    bp[j,4,4] = 1;
   }
-
-  for(i in 1:26){
-    p[1,i,2] = 0;
-    p[1,i,3] = 0;
-    p[1,i,4] = 0;
-    p[1,i,5] = 1 - p[1,i,1];
-    p[2,i,1] = 0;
-    p[2,i,3] = 0;
-    p[2,i,4] = 0;
-    p[2,i,5] = 1 - p[2,i,2];
-    p[3,i,1] = 0;
-    p[3,i,2] = 0;
-    p[3,i,4] = 0;
-    p[3,i,5] = 1 - p[3,i,3];
-    p[4,i,1] = 0;
-    p[4,i,2] = 0;
-    p[4,i,3] = 0;
-    p[4,i,5] = 1 - p[4,i,4];
-    p[5,i,1] = 0;
-    p[5,i,2] = 0;
-    p[5,i,3] = 0;
-    p[5,i,4] = 0;
-    p[5,i,5] = 1;
-    p[6,i,1] = 0;
-    p[6,i,2] = 0;
-    p[6,i,3] = 0;
-    p[6,i,4] = 0;
-    p[6,i,5] = 1;
-    p[7,i,1] = 0;
-    p[7,i,2] = 0;
-    p[7,i,3] = 0;
-    p[7,i,4] = 0;
-    p[7,i,5] = 1;
+  
+  // calculate offset for each size classes of AZGF effort and calculate expected pcap
+  mu_AZ[1] = mu_blp[1] + AZadj[1];
+  mu_AZ[2] = mu_blp[2] + AZadj[2];
+  mu_AZ[3] = mu_blp[3] + AZadj[3];
+  
+  bN[1,1] = 0;                                     
+  bN[1,2] = IN[1];
+  bN[1,3] = IN[2];
+  
+  //calculate latent abundance of brown trout from fall 2000 to end of 2017
+  for(j in 1:17){
+    for(k in 1:3){
+      bN[((j-1) * 4 + k + 1),1] = btrans[1,1,k] * bN[((j-1) * 4 + k),1];
+      bN[((j-1) * 4 + k + 1),2] = btrans[1,2,k] * bN[((j-1) * 4 + k),1] + btrans[2,2,k] * bN[((j-1) * 4 + k),2];
+      bN[((j-1) * 4 + k + 1),3] = btrans[2,3,k] * bN[((j-1) * 4 + k),2] + btrans[3,3,k] * bN[((j-1) * 4 + k),3] + exp(I[((j-1) * 4 + k)]);
+    }
+    
+    // BNT recruits produced in fall as a function weighted sum of adults (wA) and reprodutive rate (Beta) in winter
+    wA[j] = (bN[((j - 1) * 4 + 2),2] + 4 * bN[((j - 1) * 4 + 2),3]);
+    Beta[j] = exp(lbeta_0 + beta_eps[j]);
+    
+    // between summer and fall all bnt graduate to sz 2 & recruits show up
+    bN[(1 + j * 4),1] = wA[j] * Beta[j];
+    bN[(1 + j * 4),2] = btrans[1,2,4] * bN[(j * 4),1] + btrans[2,2,4] * bN[(j * 4),2];
+    bN[(1 + j * 4),3] = btrans[2,3,4] * bN[(j * 4),2] + btrans[3,3,4] * bN[(j * 4),3] + exp(I[(j * 4)]);
   }
 }
 
 model{
-  real temp[7]; 
-  vector[7] pz[27]; 
-  for(k in 1:NsumCH){ 
-    for(j in 1:6){
-      pz[sumf[k], j] = (1 - 0.03 * newtag[k]) * (j == sumCH[k, sumf[k]]); 
-    } 
-    pz[sumf[k], 7] = (0.03 * newtag[k]);  
-    for(t in (sumf[k] + 1):lc[k]){ 
-      for(i in 1:7){ 
-        for(j in 1:7){
-          temp[j] = pz[t - 1, j] * tr[j, season[(t - 1)], i] * p[i, t - 1, sumCH[k, t]]; 
-        }
-        pz[t,i] = sum(temp); 
-      } 
-    }
-    target += sumFR[k] * log(sum(pz[lc[k]])); 
-  }
-}
-
-// Code to estimate abundance by simulating from a negative binomial distribution
-generated quantities{
-  real ptrans;	
-  real<lower = 0> scale_par;
-  int U[4,9];
-  int N[4,9];
+  real pz[NCH, 23, 4];                                    
+  matrix[NAZsamps, 3]bpAZ;
+  matrix[NAZsamps, 3]blamAZ;
+  matrix[23, 3]blamNO;
+  vector[4] temp;
   
+  ///////////////////////////
+  // lphi is the logit of survival and is given a prior based on the Lorenzen
+  // function and the average mass of fish in each size class during each season.
+  // variation from the priod mode is determined by an estimated variance
+  // parameter (sd_lphi)
+  
+  lphi[1,1] ~ normal(1.08, sd_lphi);
+  lphi[1,2] ~ normal(1.14, sd_lphi);
+  lphi[1,3] ~ normal(1.26, sd_lphi);
+  lphi[1,4] ~ normal(1.38, sd_lphi);
+  lphi[2,1] ~ normal(1.96, sd_lphi);
+  lphi[2,2] ~ normal(1.96, sd_lphi);
+  lphi[2,3] ~ normal(2.02, sd_lphi);
+  lphi[2,4] ~ normal(2.02, sd_lphi);
+  lphi[3,1] ~ normal(2.29, sd_lphi);
+  lphi[3,2] ~ normal(2.29, sd_lphi);
+  lphi[3,3] ~ normal(2.29, sd_lphi);
+  lphi[3,4] ~ normal(2.29, sd_lphi);
+  ///////////////////////////
+    
+  // mean pcaps per pass on a logit scale for three size classes, plus largest size class during spawning season
   for(i in 1:4){
-    for(j in 1:9){
-      ptrans = p[i,fall_ind[j],i] * (1 - (i > 2) * (1 - tau));
-      scale_par = ptrans / (1 - ptrans);
-      U[i,j] = neg_binomial_rng(catch_mat[i,j], scale_par);
-      N[i,j] = U[i,j] + catch_mat[i,j];
+    mu_blp[i] ~ normal(-3, 2);                              
+  }
+  
+  // (done above in transformed) this loop calculates actual per pass pcaps for each trip and modifies based on # of passes
+  for(j in 1:23){
+    blp_pass[j,1] ~ normal(mu_blp[1], sd_blp);
+    blp_pass[j,2] ~ normal(mu_blp[2], sd_blp);
+    blp_pass[j,3] ~ normal(mu_blp[spawn[j]], sd_blp);
+  }
+  
+  for(k in 1:NCH){
+    pz[k,sumf[k],1] = (1 == bCH[k,sumf[k]]);
+    pz[k,sumf[k],2] = (2 == bCH[k,sumf[k]]);
+    pz[k,sumf[k],3] = (3 == bCH[k,sumf[k]]);
+    pz[k,sumf[k],4] = 0;
+    for(t in sumf[k]:(last[k] - 1)){
+      for(i in 1:4){
+        for(j in 1:4){
+          temp[j] = pz[k,t,j] * btrans[j,i,seasNO[(t + 1)]] * bp[t,i,bCH[k,(t + 1)]];
+        }
+        pz[k,(t + 1),i] = sum(temp);
+      }
+    }
+    target += FR[k] * log(sum(pz[k,last[k],]));                             
+  }
+  
+  //////////////////////////
+  // (done above in transformed) calculate offset for each size classes of AZGF effort and calculate expected pcap
+  AZadj[1] ~ normal(0,1);                                       
+  AZadj[2] ~ normal(0,1);
+  AZadj[3] ~ normal(0,1);
+  
+  // calculate actual immigration in each interval on log scale
+  for(j in 1:68){                                                 
+    I[j] ~ normal(mu_I, sd_I);
+  }
+  
+  for(j in 1:17){                                             
+    beta_eps[j] ~ normal(0, sd_beta);
+  }
+  
+  //////////////////////////
+  // 2000 - 2017 AZGF data
+  for(j in 1:3){
+    for(k in 2:3){
+      blpAZ[j,k] ~ normal(mu_AZ[k], sd_blp);
+      bpAZ[j,k] = inv_logit(blpAZ[j,k]);
+      blamAZ[j,k] = bpAZ[j,k] * bN[ts[j],k] * AZeff[j] / 35;
+      bAZ[j,k] ~ poisson(blamAZ[j,k]);
+    }
+  }
+  
+  for(j in 4:NAZsamps){
+    for(k in 1:3){
+      blpAZ[j,k] ~ normal(mu_AZ[k], sd_blp);
+      bpAZ[j,k] = inv_logit(blpAZ[j,k]);
+      blamAZ[j,k] = bpAZ[j,k] * bN[ts[j],k] * AZeff[j] / 35;
+      bAZ[j,k] ~ poisson(blamAZ[j,k]);
+    }
+  }
+  
+  // 2012 - 2017 NO: starts in april 2012
+  for(j in 1:23){
+    for(k in 1:3){
+      blamNO[j,k] = bp[j,k,k] * 0.08 * bN[(j + 46),k];
+      bNOc[j,k] ~ poisson(blamNO[j,k]);
     }
   }
 }
     
-    ",fill=TRUE)
-sink() 
+    ", fill = TRUE)
+sink()
 #-----------------------------------------------------------------------------#
-sm.data<-list(NsumCH = dim(sumCH)[1], newtag = as.vector(newtag.AO),
-              sumCH = array(sumCH,  dim = c(dim(sumCH)[1], dim(sumCH)[2])), 
-              sumf = fc, season = season, sumFR = sumFR, LCRs = LCRs,
-              LCRns = LCRns, CRs = CRs, CRns = CRns,  
-              catch_mat = array(catch,  dim = c(dim(catch)[1], dim(catch)[2])),
-              lc = lc,  fall_ind = 1:9 * 3 - 1)
+sm.data <- list(NAZsamps = NAZsamps, ts = ts, AZeff = AZeff, bAZ = bAZ,
+                seasNO = seasNO, bNOc = bNOc, NOpasses = NOpasses, ones = FR,
+                FR = FR, last = last, bCH = bCH, NCH = NCH, sumf = sumf,
+                spawn = spawn)
 
-sm.inits <- function() list(s_i = runif(4, 0, 1))  
-sm.params <- c("s_i", "g", "m", "tau", "p_cr", "p_lcr", "N") 
+sm.params = c('bphi', 'bpsi1', 'bpsi2', 'mu_blp', 'sd_blp', 'lbeta_0',
+              'mu_I', 'I', 'Beta', 'IN', 'AZadj', 'sd_I', 'sd_lphi',
+              'sd_beta', 'bN', 'bp_pass')
 
-SM <- stan(".\\Stan_Marginalized_chub.stan", 
-           data = sm.data, init = sm.inits, pars = sm.params, 
-           chains = 1, iter = 10, thin = 1, 
-           seed = 1) 
+# MCMC settings
+ni = 1000
+nt = 1
+nb = 500
+nc = 3
+
+SM.c <- stan("Stan_Marginalized.stan",
+             data = sm.data,
+             pars = sm.params,
+             control = list(max_treedepth = 14, adapt_delta = .85),
+             chains = nc, iter = ni, thin = nt, seed = 1) 
 #-----------------------------------------------------------------------------#
 ###############################################################################
 #                                                                     Spring 19
-# Multi-state Capture-Recapture model (Humpback Chub)
-# Stan Marginalized Version with random effects
+#  Fitting an Integrated Population Model to Brown Trout Data
+#  Marginalized Stan version - Removes prior on survival & random effects on
+#  detection
 #
 #  Notes:
+#  * The model runs from the fall of 2000 to fall of 2017 on a seasonal basis
+#  * We define three size states based on total length in mm 
+#    - 0 - 200; 200 - 350; 350 +
 #  * Need to set directory for data
-#  * See Notes above
+#  * Need to supply JAGS/WinBUGS/Stan settings
+#
 ###############################################################################
 library(rstan)
-
-# To run Stan in parallel:
 rstan_options(auto_write = TRUE)
-options(mc.cores = parallel::detectCores())
+options(mc.cores = parallel::detectCores()) 
 
-# Get data:
-dat <- read.csv(".//HBC_data.csv")
-#-----------------------------------------------------------------------------#
-#  Functions:
-#	Get first capture occasion:
-find.first <- function(x){min(which(x != 5))}
-
-#	Get last capture occasion:
-find.last <- function(x){
-  ifelse(length(which(x != 5)) == 1, 27, max(which(x != 5)))
-  }
-#-----------------------------------------------------------------------------#
-# format data for model fitting:
-sumCH <- as.matrix(dat[,1:27])
-sumFR <- dat[,28]
-newtag.AO <- dat[,29]
-
-# other data:
-season <- c(rep(1:3, 8), 1:2) # season index
-LCRs <- c(2, 3, 5, 6, 8, 9, 11:26)
-LCRns <- c(1, 4, 7, 10)
-CRs <- c(1, 2, 4, 5, 7:26)
-CRns <- c(3, 6)
-catch <- matrix(c(287, 545, 221, 594, 215, 413, 500, 374, 562,
-                 193, 356, 171, 191, 111, 239, 259, 283, 246,
-                 102, 129, 154, 54, 63, 48, 36, 41, 35,
-                 35, 86, 126, 41, 43, 59, 22, 26, 34), nrow = 4, byrow = TRUE)
-
-# Get first and last capture occasion for line in summarized capture history
-fc <- apply(sumCH, 1, find.first)
-lc <- apply(sumCH, 1, find.last)
-
-# Use this to calculate abundance in code:
-CR_ind <- matrix(0, nrow = 4, ncol = 9)
-1 -> CR_ind[3:4,]
+# read in data
+NO_catch <- read.csv(paste0(getwd(), "/Data/", "NO_catch.csv"), header = TRUE)
+AZGF_catch <- read.csv(paste0(getwd(), "/Data/", "AZGF_catch.csv"), header = TRUE)
+MR_data <- read.csv(paste0(getwd(), "/Data/", "bCH.csv"), header = FALSE)
 
 #-----------------------------------------------------------------------------#
-sink("Stan_Marginalized_chub_RE.stan")
+# extract/reformat data
+bNOc <- as.matrix(NO_catch[,1:3])
+NOpasses <- NO_catch$NOpasses
+seasNO <- NO_catch$seasNO
+spawn <- ifelse(seasNO == 1, 4, 3)
+bAZ <- as.matrix(AZGF_catch[,1:3])
+ts <- AZGF_catch$ts
+AZeff <- AZGF_catch$AZeff
+NAZsamps <- length(AZeff)
+
+# capture-recapture data
+allCH <- MR_data[,1:23]
+
+bCH = collapse.ch(allCH)[[1]]
+FR = collapse.ch(allCH)[[2]]
+
+findlast <- function(x){ifelse(x[23] == 1, 22, max(which(x[1:22] != 4)))}
+last <- apply(bCH, 1, findlast)
+
+NCH <- length(last)
+findfirst <- function(x){which(x != 4)[1]}
+sumf <- apply(bCH, 1, findfirst)
+
+#-----------------------------------------------------------------------------#
+sink("nop_nore.stan")
 cat("
 data{
-  int<lower = 1> NsumCH;
-  int<lower = 1, upper = 5> sumCH[NsumCH,  27];
-  int<lower = 1, upper = 26> sumf[NsumCH];
-  int<lower = 1, upper = 3> season[26];
-  int<lower = 1> sumFR[NsumCH];
-  int<lower = 1> LCRs [22];
-  int<lower = 1> LCRns [4];
-  int<lower = 1> CRs [24];
-  int<lower = 1> CRns [2];
-  int catch_mat[4, 9];
-  int fall_ind[9];
-  int<lower = 2,  upper = 27> lc[NsumCH];
-  int<lower = 0,  upper = 1> newtag[NsumCH];
+  int NAZsamps;                            // Number of samples AGFD
+  int ts[NAZsamps];
+  vector [NAZsamps] AZeff;
+  int bAZ [NAZsamps, 3];
+  int seasNO[23];
+  int bNOc[23,3];
+  int NOpasses[23];
+  int NCH;                       // Number of capture histories
+  int FR[NCH];
+  int last[NCH];
+  int bCH[NCH, 23];
+  int sumf[NCH];
+  int spawn[23];               // Indicator for spawning month
 }
 
-parameters {
-  real<lower = -8, upper = 8> mu_ls[4]; // hyperprior on 3 month survivals for small and large chub in LCR and CR
-  real<lower = 0> sd_ls; // hyperprior on 3 month survivals for small and large chub in LCR and CR
-  real<lower = 0, upper = 1> tau; // proportion of CR adults residing in observable location
-  vector<lower = -8, upper = 8> [2] mu_lg [3]; // hyperprior on seasonal growth for two rivers
-  vector<lower = -8, upper = 8> [4] mu_lm [3]; // hyperprior on seasonal movement rates for 2 sizes and locations
-  real<lower = 0> sd_lg ; // hyperprior on seasonal growth for two rivers
-  real<lower = 0> sd_lm ; // hyperprior on seasonal movement rates for 2 sizes and locations
-  vector<lower = 0, upper = 1> [2] p_lcr [22]; // recapture probability in LCR for two size classes
-  vector<lower = 0, upper = 1> [2] p_cr[24]; // recapture probability in CR for two size classes
-  vector [4] z_ls [26]; 
-  vector [4] z_lm [26]; 
-  vector [2] z_lg [26];
+parameters{
+  matrix<lower = 0, upper = 1>[3, 4]bphi;
+  real<lower = 0, upper = 1> bpsi2;
+  vector<lower = 0, upper = 1>[3] bpsi1;
+  vector<lower = 0, upper = 1>[4] mu_blp;
+  vector<lower = 0, upper = 1>[3] mu_AZ;
+  vector<lower = 0, upper = 1000>[2] IN;                              
+  vector<lower = -4, upper = 8>[68] I;
+  vector<lower = 0, upper = 4>[17] Beta;
 }
 
-transformed parameters {
-  vector<lower = 0, upper = 1> [4] s [26]; // survival for all intervals, 2 locations, and 2 size classes
-  vector<lower = 0, upper = 1> [2] g [26]; // growth for all intervals and 2 size classes
-  vector<lower = 0, upper = 1> [4] m [26]; // movement for all intervals, 2 locations, and 2 size classes
-  simplex[7] tr[7,26];
-  simplex[5] p[7,26];
-  vector [4] ls [26]; // logit survival for all intervals, 2 locations, and 2 size classes
-  vector [2] lg [26]; // logit growth for all intervals and 2 size classes
-  vector [4] lm [26]; // logit movement for all intervals, 2 locations, and 2 size classes
+transformed parameters{
+  real btrans[4, 4, 4];                                                     
+  matrix[23,3]bp_pass;
+  real bp[23,4,4];                                                          
+  matrix[69,3] bN;                                                          
+  vector[17] wA;
   
-  for(j in 1:4){
-    for(i in 1:26){
-      ls[i,j] = mu_ls[j] + z_ls[i,j] * sd_ls;
-    }
-  }
-  for(j in 1:4){
-    for(i in 1:26){
-      lm[i,j] = mu_lm[season[i],j] + z_lm[i,j] * sd_lm;
-    }
-  }
-  for(j in 1:2){
-    for(i in 1:26){
-      lg[i,j] = mu_lg[season[i],j] + z_lg[i,j] * sd_lg;
-    }
-  }   
   
-  for(j in 1:2) g[,j] = inv_logit(lg[,j]);
-  for(j in 1:4) m[,j] = inv_logit(lm[,j]);
-  for(j in 1:4){
-    for(i in 1:26){
-      s[i,j] = (inv_logit(ls[i,j]))^(season[i]>2 ? 2 : 1);
-    }
+  for(j in 1:23){
+    bp_pass[j,1]=mu_blp[1];
+    bp_pass[j,2]=mu_blp[2];
+    bp_pass[j,3]=mu_blp[spawn[j]];
   }
   
-  // state transition matrix:
-    for(i in 1:26){
-      tr[1,i,1] = s[i,1] * (1 - g[i,1]) * (1 - m[i,1]);
-      tr[1,i,2] = s[i,1] * g[i,1] * (1 - m[i,2]);
-      tr[1,i,3] = s[i,1] * (1 - g[i,1]) * m[i,1] * tau;
-      tr[1,i,4] = s[i,1] * g[i,1] * m[i,2] * tau;
-      tr[1,i,5] = s[i,1] * (1 - g[i,1]) * m[i,1] * (1 - tau);
-      tr[1,i,6] = s[i,1] * g[i,1] * m[i,2] * (1 - tau);
-      tr[1,i,7] = 1 - s[i,1];
-      tr[2,i,1] = 0;
-      tr[2,i,2] = s[i,2] * (1 - m[i,2]);
-      tr[2,i,3] = 0;
-      tr[2,i,4] = s[i,2] * m[i,2] * tau;
-      tr[2,i,5] = 0;
-      tr[2,i,6] = s[i,2] * m[i,2] * (1 - tau);
-      tr[2,i,7] = 1 - s[i,2];
-      tr[3,i,1] = s[i,3] * (1 - g[i,2]) * m[i,3];
-      tr[3,i,2] = s[i,3] * g[i,2] * m[i,4];
-      tr[3,i,3] = s[i,3] * (1 - g[i,2]) * (1 - m[i,3]);
-      tr[3,i,4] = s[i,3] * g[i,2] * (1 - m[i,4]);
-      tr[3,i,5] = 0;
-      tr[3,i,6] = 0;
-      tr[3,i,7] = 1 - s[i,3];
-      tr[4,i,1] = 0;
-      tr[4,i,2] = s[i,4] * m[i,4];
-      tr[4,i,3] = 0;
-      tr[4,i,4] = s[i,4] * (1 - m[i,4]);
-      tr[4,i,5] = 0;
-      tr[4,i,6] = 0;
-      tr[4,i,7] = 1 - s[i,4];
-      tr[5,i,1] = tr[3,i,1];
-      tr[5,i,2] = tr[3,i,2];
-      tr[5,i,3] = 0;
-      tr[5,i,4] = 0;
-      tr[5,i,5] = tr[3,i,3];
-      tr[5,i,6] = tr[3,i,4];
-      tr[5,i,7] = tr[3,i,7];
-      tr[6,i,1] = 0;
-      tr[6,i,2] = tr[4,i,2];
-      tr[6,i,3] = 0;
-      tr[6,i,4] = 0;
-      tr[6,i,5] = 0;
-      tr[6,i,6] = tr[4,i,4];
-      tr[6,i,7] = tr[4,i,7];
-      for(j in 1:6){
-        tr[7,i,j] = 0;
-      }
-      tr[7,i,7] = 1;
-    }
   
-  // capture probability matrix
-  for(i in 1:22){
-    p[1,LCRs[i],1] = p_lcr[i,1];
-    p[2,LCRs[i],2] = p_lcr[i,2];
-  }
-  // No sampling in LCR during 1st, 4th, 7th, 10th recap periods (summers of 2009 - 2012)
+  // define transition matrix that combines survival and growth parameters
   for(i in 1:4){
-    p[1,LCRns[i],1] = 0;
-    p[2,LCRns[i],2] = 0;
+    btrans[1,3,i] = 0;
+    btrans[1,4,i] = 1 - bphi[1,i];
+    btrans[2,1,i] = 0;
+    btrans[2,2,i] = bphi[2,i] * (1 - bpsi2);
+    btrans[2,3,i] = bphi[2,i] * bpsi2;
+    btrans[2,4,i] = 1 - bphi[2,i];
+    btrans[3,1,i] = 0;
+    btrans[3,2,i] = 0;
+    btrans[3,3,i] = bphi[3,i];
+    btrans[3,4,i] = 1 - bphi[3,i];
+    btrans[4,1,i] = 0;
+    btrans[4,2,i] = 0;
+    btrans[4,3,i] = 0;
+    btrans[4,4,i] = 1;
   }
-  for(i in 1:24){
-    p[3,CRs[i],3] = p_cr[i,1];
-    p[4,CRs[i],4] = p_cr[i,2];
+  
+  // size class one transitions are done separately because growth is allowed to vary between seasons
+  for(i in 1:3){
+    btrans[1,1,i] = bphi[1,i] * (1 - bpsi1[i]);
+    btrans[1,2,i] = bphi[1,i] * bpsi1[i];
   }
-  // No sampling in CR during 3rd and 6th recap periods (spring of 2010 & 2011)
-  for(i in 1:2){
-    p[3,CRns[i],3] = 0;
-    p[4,CRns[i],4] = 0;
+  
+  btrans[1,1,4] = 0;
+  btrans[1,2,4] = bphi[1,4];
+  
+  // this loop calculates actual per pass pcaps for each trip and modifies based on # of passes
+  for(j in 1:23){
+    for(k in 1:3){
+      bp[j,k,k] = 1 - pow((1 - bp_pass[j,k]), NOpasses[j]);                 
+      bp[j,k,4] = 1 - bp[j,k,k];
+    }
+    
+    bp[j,1,2] = 0;
+    bp[j,1,3] = 0;
+    bp[j,2,1] = 0;
+    bp[j,2,3] = 0;
+    bp[j,3,1] = 0;
+    bp[j,3,2] = 0;
+    bp[j,4,1] = 0;
+    bp[j,4,2] = 0;
+    bp[j,4,3] = 0;
+    bp[j,4,4] = 1;
   }
-  for(i in 1:26){
-    p[1,i,2] = 0;
-    p[1,i,3] = 0;
-    p[1,i,4] = 0;
-    p[1,i,5] = 1 - p[1,i,1]; // prob of fish in state 1 not being captured 
-    p[2,i,1] = 0;
-    p[2,i,3] = 0;
-    p[2,i,4] = 0;
-    p[2,i,5] = 1 - p[2,i,2]; // prob of fish in state 2 not being captured 
-    p[3,i,1] = 0;
-    p[3,i,2] = 0;
-    p[3,i,4] = 0;
-    p[3,i,5] = 1 - p[3,i,3] ; // prob of fish in state 3 not being captured 
-    p[4,i,1] = 0;
-    p[4,i,2] = 0;
-    p[4,i,3] = 0;
-    p[4,i,5] = 1 - p[4,i,4]; // prob of fish in state 4 not being captured 
-    p[5,i,1] = 0;
-    p[5,i,2] = 0;
-    p[5,i,3] = 0;
-    p[5,i,4] = 0;
-    p[5,i,5] = 1; // prob of fish in state 5 not being captured (set to 100% since these fish are unobserveable) 
-    p[6,i,1] = 0;
-    p[6,i,2] = 0;
-    p[6,i,3] = 0;
-    p[6,i,4] = 0;
-    p[6,i,5] = 1; // prob of fish in state 6 not being captured (set to 100% since these fish are unobserveable) 
-    p[7,i,1] = 0;
-    p[7,i,2] = 0;
-    p[7,i,3] = 0;
-    p[7,i,4] = 0;
-    p[7,i,5] = 1; // prob of fish in state 7 not being captured (set to 100% since these fish are dead) 
+  
+  // calculate offset for each size classes of AZGF effort and calculate expected pcap
+  
+  bN[1,1] = 0;                                     
+  bN[1,2] = IN[1];
+  bN[1,3] = IN[2];
+  
+  //calculate latent abundance of brown trout from fall 2000 to end of 2017
+  for(j in 1:17){
+    for(k in 1:3){
+      bN[((j-1) * 4 + k + 1),1] = btrans[1,1,k] * bN[((j-1) * 4 + k),1];
+      bN[((j-1) * 4 + k + 1),2] = btrans[1,2,k] * bN[((j-1) * 4 + k),1] + btrans[2,2,k] * bN[((j-1) * 4 + k),2];
+      bN[((j-1) * 4 + k + 1),3] = btrans[2,3,k] * bN[((j-1) * 4 + k),2] + btrans[3,3,k] * bN[((j-1) * 4 + k),3] + exp(I[((j-1) * 4 + k)]);
+    }
+    
+    // BNT recruits produced in fall as a function weighted sum of adults (wA) and reprodutive rate (Beta) in winter
+    wA[j] = (bN[((j - 1) * 4 + 2),2] + 4 * bN[((j - 1) * 4 + 2),3]);
+    
+    // between summer and fall all bnt graduate to sz 2 & recruits show up
+    bN[(1 + j * 4),1] = wA[j] * Beta[j];
+    bN[(1 + j * 4),2] = btrans[1,2,4] * bN[(j * 4),1] + btrans[2,2,4] * bN[(j * 4),2];
+    bN[(1 + j * 4),3] = btrans[2,3,4] * bN[(j * 4),2] + btrans[3,3,4] * bN[(j * 4),3] + exp(I[(j * 4)]);
   }
 }
 
 model{
-  real temp[7]; 
-  vector[7] pz[27]; 
+  real pz[NCH, 23, 4];                                    
+  matrix[NAZsamps, 3]blamAZ;
+  matrix[23, 3]blamNO;
+  vector[4] temp;
   
-  for(i in 1:26){
-    z_ls[i] ~ normal(0, 1);
-    z_lg[i] ~ normal(0, 1);
-    z_lm[i] ~ normal(0, 1);
-  }
   
-  mu_ls ~ normal(0, 2);
+  // (done above in transformed) this loop calculates actual per pass pcaps for each trip and modifies based on # of passes
   
-  for(i in 1:3){
-    mu_lm[i] ~ normal(0, 2);
-    mu_lg[i] ~ normal(0, 2);
-  }
-  
-  for(k in 1:NsumCH){  
-    for(j in 1:6){
-      pz[sumf[k],j] = (j == sumCH[k, sumf[k]]) * (1 - newtag[k] * 0.03); 
-    }
-    pz[sumf[k],7] = newtag[k] * 0.03;     
-    for(t in (sumf[k] + 1):lc[k]){ 
-      for(i in 1:7){ 
-        for(j in 1:7){
-          temp[j] = pz[t - 1,j] * tr[j,t - 1,i] * p[i,t - 1,sumCH[k,t]];
+  for(k in 1:NCH){
+    pz[k,sumf[k],1] = (1 == bCH[k,sumf[k]]);
+    pz[k,sumf[k],2] = (2 == bCH[k,sumf[k]]);
+    pz[k,sumf[k],3] = (3 == bCH[k,sumf[k]]);
+    pz[k,sumf[k],4] = 0;
+    for(t in sumf[k]:(last[k] - 1)){
+      for(i in 1:4){
+        for(j in 1:4){
+          temp[j] = pz[k,t,j] * btrans[j,i,seasNO[(t + 1)]] * bp[t,i,bCH[k,(t + 1)]];
         }
-        pz[t,i] = sum(temp); 
-      } 
-    } 
-    target += (sumFR[k] * log(sum(pz[lc[k]]))); 
+        pz[k,(t + 1),i] = sum(temp);
+      }
+    }
+    target += FR[k] * log(sum(pz[k,last[k],]));                             
   }
-}
-
-//Code to estimate abundance by simulating from a negative binomial distribution
-generated quantities{
-  real ptrans;	
-  real<lower = 0> scale_par;
-  int U[4,9];
-  int N[4,9];
-  int N_tot[9];
   
-  for(i in 1:4){
-    for(j in 1:9){
-      ptrans = p[i,fall_ind[j],i] * (1 - (i > 2) * (1 - tau));
-      scale_par = ptrans / (1 - ptrans);
-      U[i,j] = neg_binomial_rng(catch_mat[i,j], scale_par);
-      N[i,j] = U[i,j] + catch_mat[i,j];
+  //////////////////////////
+    
+    // calculate actual immigration in each interval on log scale
+  
+  //////////////////////////
+    // 2000 - 2017 AZGF data
+  for(j in 1:3){
+    for(k in 2:3){
+      blamAZ[j,k] = mu_AZ[k] * bN[ts[j],k] * AZeff[j] / 35;
+      bAZ[j,k] ~ poisson(blamAZ[j,k]);
     }
   }
   
-  for(j in 1:9){
-    N_tot[j]= sum(N[,j]);
+  
+  for(j in 4:NAZsamps){
+    for(k in 1:3){
+      blamAZ[j,k] = mu_AZ[k] * bN[ts[j],k] * AZeff[j] / 35;
+      bAZ[j,k] ~ poisson(blamAZ[j,k]);
+    }
+  }
+  
+  
+  // 2012 - 2017 NO: starts in april 2012
+  for(j in 1:23){
+    for(k in 1:3){
+      blamNO[j,k] = bp[j,k,k] * 0.08 * bN[(j + 46),k];
+      bNOc[j,k] ~ poisson(blamNO[j,k]);
+    }
   }
 }
 
-    ",fill=TRUE)
-sink() 
-
+    ", fill = TRUE)
+sink()
 #-----------------------------------------------------------------------------#
-smre.data <- list(NsumCH = dim(sumCH)[1], sumCH = sumCH, sumf = as.vector(fc),
-                  season = season, sumFR = sumFR, LCRs = LCRs, LCRns = LCRns,
-                  CRs = CRs, CRns = CRns, fall_ind = 1:9 * 3 - 1,
-                  catch_mat = array(catch, dim = c(dim(catch)[1], dim(catch)[2])),
-                  lc = as.vector(lc), newtag = as.vector(newtag.AO))
+sm.data <- list(NAZsamps = NAZsamps, ts = ts, AZeff = AZeff, bAZ = bAZ,
+                seasNO = seasNO, bNOc = bNOc, NOpasses = NOpasses, NCH = NCH,
+                FR = FR, last = last, bCH = bCH, sumf = sumf, spawn = spawn)
 
-smre.inits <- function() {list(mu_ls = rep(0, 4))}
+sm.params <- c('bphi', 'bpsi1', 'bpsi2', "I", "Beta", "IN", "bN", "mu_AZ", "mu_blp")
 
-smre.params <- c("s", "g", "m", "mu_ls", "mu_lg", "mu_lm", "sd_ls", "sd_lm", 
-                 "sd_lg", "tau", "p_lcr", "p_cr", "N") 
+# MCMC settings
+ni = 10
+nt = 1
+nb = 5
+nc = 1
 
-SMRE <- stan(".\\Stan_Marginalized_chub_RE.stan", 
-             data = smre.data, init =smre.inits, pars = smre.params, 
-             chains = 1, iter = 10, thin = 1, 
-             seed = 1) 
+# Call Stan from R 
+SM.nop.nore <- stan("nop_nore.stan",
+                    data = sm.data,
+                    pars = sm.params,
+                    control = list(max_treedepth = 14, adapt_delta = .85),
+                    chains = nc, iter = ni, thin = nt, seed = 1) 
+
 #-----------------------------------------------------------------------------#
 # End
